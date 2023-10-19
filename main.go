@@ -5,19 +5,24 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/superfly/macaroon"
+	"github.com/superfly/macaroon/flyio"
+	"github.com/superfly/macaroon/tp"
 )
 
 const (
-	MacaroonLocation = "https://cookiebot.fly.dev/ticket"
+	LocationPath     = "/ticket"
+	MacaroonLocation = "https://cookiebot.fly.dev" + LocationPath
 	TestChannel      = "C0603H9UZA4" // i should be purged i should be flogged
 )
 
@@ -40,11 +45,12 @@ func e500(w http.ResponseWriter, desc string, err error) bool {
 }
 
 type chanAsk struct {
-	slackts string
-	name    string
-	reply   chan chanReply
-	ts      time.Time
-	kill    bool
+	slackts    string
+	name       string
+	reply      chan chanReply
+	pollSecret string
+	ts         time.Time
+	kill       bool
 }
 
 type chanReply struct {
@@ -53,6 +59,7 @@ type chanReply struct {
 }
 
 type Bot struct {
+	tp             *tp.TP
 	macaroonSecret []byte
 	signingSecret  string
 	api            *slack.Client
@@ -73,7 +80,16 @@ func (b *Bot) WaitLoop(ctx context.Context) {
 		case reply := <-b.reacts:
 			for _, ask := range asks {
 				if ask.slackts == reply.slackts {
-					ask.reply <- reply
+					if ask.reply != nil {
+						ask.reply <- reply
+					}
+					if ask.pollSecret != "" {
+						if reply.answer {
+							b.tp.DischargePoll(ask.pollSecret)
+						} else {
+							b.tp.AbortPoll(ask.pollSecret, fmt.Sprintf("rejected by @%s", reply.name))
+						}
+					}
 				}
 			}
 
@@ -111,10 +127,47 @@ func (b *Bot) WaitLoop(ctx context.Context) {
 	}
 }
 
-func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-attenuate")
 
-	body, err := ioutil.ReadAll(r.Body)
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, io.LimitReader(r.Body, 10000)); e500(w, "read", err) {
+		return
+	}
+
+	permTok, dissToks, err := flyio.ParsePermissionAndDischargeTokens(buf.String())
+	if e500(w, "parse", err) {
+		return
+	}
+
+	// discourage sending of entire token...
+	if len(dissToks) != 0 {
+		http.Error(w, "only send permission token!", http.StatusBadRequest)
+	}
+
+	perm, err := macaroon.Decode(permTok)
+	if e500(w, "decode", err) {
+		return
+	}
+
+	if err := perm.Add3P(b.macaroonSecret, MacaroonLocation); e500(w, "attenuate", err) {
+		return
+	}
+
+	permStr, err := perm.String()
+	if e500(w, "encode", err) {
+		return
+	}
+
+	if _, err := w.Write([]byte(permStr)); e("write", err) {
+		return
+	}
+}
+
+func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-event")
+
+	body, err := io.ReadAll(r.Body)
 	if e500(w, "read", err) {
 		return
 	}
@@ -164,7 +217,7 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 			slog.Info("posted", "ch", ch, "ts", ts)
 
 		case *slackevents.ReactionAddedEvent:
-			switch ev.Reaction {
+			switch reaction, _, _ := strings.Cut(ev.Reaction, "::"); reaction {
 			case "+1", "celeryman", "celebrate", "yes":
 				b.reacts <- chanReply{
 					name:    ev.User,
@@ -197,6 +250,8 @@ type TicketReply struct {
 }
 
 func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-ticket")
+
 	tr := TicketRequest{}
 
 	err := json.NewDecoder(r.Body).Decode(&tr)
@@ -204,8 +259,12 @@ func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, dm, err := macaroon.DischargeCID(b.macaroonSecret, MacaroonLocation, tr.Ticket)
+	cavs, dm, err := macaroon.DischargeTicket(b.macaroonSecret, MacaroonLocation, tr.Ticket)
 	if e500(w, "decode ticket", err) {
+		return
+	}
+	if len(cavs) != 0 {
+		http.Error(w, "unsupported caveats in 3p caveat", http.StatusBadRequest)
 		return
 	}
 
@@ -257,6 +316,35 @@ func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (b *Bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "discharge-init")
+
+	switch cavs, err := tp.CaveatsFromRequest(r); {
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case len(cavs) != 0:
+		http.Error(w, "unsupported caveats in 3p caveat", http.StatusBadRequest)
+		return
+	}
+
+	_, ts, err := b.api.PostMessage(TestChannel,
+		slack.MsgOptionText(":interrobang: attempting to deploy. :+1: or :-1:?", false))
+	if err != nil {
+		e("post", err)
+	}
+
+	pollSecret := b.tp.RespondPoll(w, r)
+	if pollSecret == "" {
+		return
+	}
+
+	b.asks <- chanAsk{
+		slackts:    ts,
+		pollSecret: pollSecret,
+	}
+}
+
 func main() {
 	s64 := os.Getenv("MACAROON_SECRET")
 	if s64 == "" {
@@ -274,18 +362,45 @@ func main() {
 		return
 	}
 
+	store, err := tp.NewMemoryStore(nil, 1000)
+	if e("create memory store", err) {
+		return
+	}
+
 	b := &Bot{
 		macaroonSecret: secret,
 		signingSecret:  os.Getenv("SLACK_SIGNING_SECRET"),
 		api:            slack.New(os.Getenv("SLACK_BOT_TOKEN")),
 		asks:           make(chan chanAsk),
 		reacts:         make(chan chanReply),
+		tp: &tp.TP{
+			Location: MacaroonLocation,
+			Key:      secret,
+			Store:    store,
+			Log:      logrus.StandardLogger(),
+		},
 	}
 
+	http.HandleFunc("/attenuate", b.PostAttenuate)
 	http.HandleFunc("/events-endpoint", b.PostEvent)
 	http.HandleFunc("/ticket", b.PostTicket)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "404")
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	http.Handle(LocationPath+tp.InitPath, b.tp.InitRequestMiddleware(
+		http.HandlerFunc(b.HandleDischargeInit),
+	))
+
+	http.HandleFunc(LocationPath+tp.PollPathPrefix, b.tp.HandlePollRequest)
 
 	slog.Info("server listening", "port", ":3000")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go b.WaitLoop(ctx)
 
 	http.ListenAndServe(":3000", nil)
 }
