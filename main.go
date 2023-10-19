@@ -5,16 +5,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/superfly/macaroon"
+	"github.com/superfly/macaroon/flyio"
 	"github.com/superfly/macaroon/tp"
 )
 
@@ -124,6 +127,43 @@ func (b *Bot) WaitLoop(ctx context.Context) {
 	}
 }
 
+func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, io.LimitReader(r.Body, 10000)); e500(w, "read", err) {
+		return
+	}
+
+	permTok, dissToks, err := flyio.ParsePermissionAndDischargeTokens(buf.String())
+	if e500(w, "parse", err) {
+		return
+	}
+
+	// discourage sending of entire token...
+	if len(dissToks) != 0 {
+		http.Error(w, "only send permission token!", http.StatusBadRequest)
+	}
+
+	perm, err := macaroon.Decode(permTok)
+	if e500(w, "decode", err) {
+		return
+	}
+
+	if err := perm.Add3P(b.macaroonSecret, MacaroonLocation); e500(w, "attenuate", err) {
+		return
+	}
+
+	permStr, err := perm.String()
+	if e500(w, "encode", err) {
+		return
+	}
+
+	if _, err := w.Write([]byte(permStr)); e("write", err) {
+		return
+	}
+}
+
 func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
 
@@ -210,6 +250,8 @@ type TicketReply struct {
 }
 
 func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+
 	tr := TicketRequest{}
 
 	err := json.NewDecoder(r.Body).Decode(&tr)
@@ -275,6 +317,8 @@ func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+
 	switch cavs, err := tp.CaveatsFromRequest(r); {
 	case err != nil:
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -337,6 +381,7 @@ func main() {
 		},
 	}
 
+	http.HandleFunc("/attenuate", b.PostAttenuate)
 	http.HandleFunc("/events-endpoint", b.PostEvent)
 	http.HandleFunc("/ticket", b.PostTicket)
 
