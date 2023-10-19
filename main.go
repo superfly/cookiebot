@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,7 +21,8 @@ import (
 )
 
 const (
-	MacaroonLocation = "https://cookiebot.fly.dev/ticket"
+	LocationPath     = "/ticket"
+	MacaroonLocation = "https://cookiebot.fly.dev" + LocationPath
 	TestChannel      = "C0603H9UZA4" // i should be purged i should be flogged
 )
 
@@ -128,7 +128,7 @@ func (b *Bot) WaitLoop(ctx context.Context) {
 }
 
 func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-attenuate")
 
 	var buf strings.Builder
 	if _, err := io.Copy(&buf, io.LimitReader(r.Body, 10000)); e500(w, "read", err) {
@@ -165,9 +165,9 @@ func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-event")
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if e500(w, "read", err) {
 		return
 	}
@@ -217,7 +217,7 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 			slog.Info("posted", "ch", ch, "ts", ts)
 
 		case *slackevents.ReactionAddedEvent:
-			switch ev.Reaction {
+			switch reaction, _, _ := strings.Cut(ev.Reaction, "::"); reaction {
 			case "+1", "celeryman", "celebrate", "yes":
 				b.reacts <- chanReply{
 					name:    ev.User,
@@ -250,7 +250,7 @@ type TicketReply struct {
 }
 
 func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-ticket")
 
 	tr := TicketRequest{}
 
@@ -317,7 +317,7 @@ func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL)
+	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "discharge-init")
 
 	switch cavs, err := tp.CaveatsFromRequest(r); {
 	case err != nil:
@@ -384,14 +384,23 @@ func main() {
 	http.HandleFunc("/attenuate", b.PostAttenuate)
 	http.HandleFunc("/events-endpoint", b.PostEvent)
 	http.HandleFunc("/ticket", b.PostTicket)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "404")
+		w.WriteHeader(http.StatusNotFound)
+	})
 
-	http.Handle(MacaroonLocation+"/"+tp.InitPath, b.tp.InitRequestMiddleware(
+	http.Handle(LocationPath+tp.InitPath, b.tp.InitRequestMiddleware(
 		http.HandlerFunc(b.HandleDischargeInit),
 	))
 
-	http.HandleFunc(MacaroonLocation+"/"+tp.PollPathPrefix, b.tp.HandlePollRequest)
+	http.HandleFunc(LocationPath+tp.PollPathPrefix, b.tp.HandlePollRequest)
 
 	slog.Info("server listening", "port", ":3000")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go b.WaitLoop(ctx)
 
 	http.ListenAndServe(":3000", nil)
 }
