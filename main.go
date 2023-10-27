@@ -143,6 +143,7 @@ func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
 	// discourage sending of entire token...
 	if len(dissToks) != 0 {
 		http.Error(w, "only send permission token!", http.StatusBadRequest)
+		return
 	}
 
 	perm, err := macaroon.Decode(permTok)
