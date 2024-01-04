@@ -1,0 +1,5 @@
+macaroon_location: https://${FLY_APP_NAME}.fly.dev/ticket
+macaroon_secret: ${MACAROON_SECRET}
+slack_channel: ${COOKIEBOT_CHANNEL}
+slack_signing_secret: ${SLACK_SIGNING_SECRET}
+slack_bot_token: ${SLACK_BOT_TOKEN}

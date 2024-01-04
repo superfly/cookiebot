@@ -1,12 +1,13 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -15,157 +16,100 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
-	"github.com/superfly/macaroon"
-	"github.com/superfly/macaroon/flyio"
 	"github.com/superfly/macaroon/tp"
+	"gopkg.in/yaml.v3"
 )
 
-const (
-	LocationPath     = "/ticket"
-	MacaroonLocation = "https://cookiebot.fly.dev" + LocationPath
-	TestChannel      = "C0603H9UZA4" // i should be purged i should be flogged
-)
-
-func e(desc string, err error) bool {
-	if err == nil {
-		return false
-	}
-
-	slog.Error(desc, "error", err)
-	return true
-}
-
-func e500(w http.ResponseWriter, desc string, err error) bool {
-	if e(desc, err) {
-		w.WriteHeader(http.StatusInternalServerError)
-		return true
-	}
-
-	return false
-}
-
-type chanAsk struct {
-	slackts    string
-	name       string
-	reply      chan chanReply
+type ask struct {
+	slackTS    string
 	pollSecret string
 	ts         time.Time
-	kill       bool
 }
 
-type chanReply struct {
-	name, slackts string
-	answer        bool
+type reply struct {
+	name    string
+	slackTS string
+	answer  bool
 }
 
-type Bot struct {
-	tp             *tp.TP
-	macaroonSecret []byte
-	signingSecret  string
-	api            *slack.Client
-	asks           chan chanAsk
-	reacts         chan chanReply
+type bot struct {
+	config  *config
+	tp      *tp.TP
+	api     *slack.Client
+	asks    chan *ask
+	replies chan *reply
+	*http.ServeMux
 }
 
-func (b *Bot) WaitLoop(ctx context.Context) {
-	asks := []*chanAsk{}
+func newBot(c *config) *bot {
+	store, _ := tp.NewMemoryStore(nil, 1000)
 
+	b := &bot{
+		config:  c,
+		api:     slack.New(c.SlackBotToken),
+		asks:    make(chan *ask),
+		replies: make(chan *reply),
+		tp: &tp.TP{
+			Location: c.MacaroonLocation,
+			Key:      c.getMacaroonSecret(),
+			Store:    store,
+			Log:      logrus.StandardLogger(),
+		},
+		ServeMux: http.NewServeMux(),
+	}
+
+	b.ServeMux.HandleFunc("/events-endpoint", b.PostEvent)
+
+	b.ServeMux.Handle("/ticket"+tp.InitPath, b.tp.InitRequestMiddleware(
+		http.HandlerFunc(b.HandleDischargeInit),
+	))
+
+	b.ServeMux.HandleFunc("/ticket"+tp.PollPathPrefix, b.tp.HandlePollRequest)
+
+	b.ServeMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "404")
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	return b
+}
+
+func (b *bot) waitLoop() {
+	asks := map[string]*ask{}
 	tick := time.NewTicker(5 * time.Second)
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
-
-		case reply := <-b.reacts:
-			for _, ask := range asks {
-				if ask.slackts == reply.slackts {
-					if ask.reply != nil {
-						ask.reply <- reply
-					}
-					if ask.pollSecret != "" {
-						if reply.answer {
-							b.tp.DischargePoll(ask.pollSecret)
-						} else {
-							b.tp.AbortPoll(ask.pollSecret, fmt.Sprintf("rejected by @%s", reply.name))
-						}
-					}
-				}
+		case reply := <-b.replies:
+			a, ok := asks[reply.slackTS]
+			if !ok {
+				continue
 			}
 
-		case newAsk := <-b.asks:
-			switch {
-			case newAsk.kill:
-				newAsks := []*chanAsk{}
-
-				for _, ask := range asks {
-					if ask.slackts != newAsk.slackts {
-						newAsks = append(newAsks, ask)
-					}
-				}
-
-				asks = newAsks
-
-			default:
-				newAsk.ts = time.Now()
-				asks = append(asks, &newAsk)
+			if reply.answer {
+				e("discharge", b.tp.DischargePoll(a.pollSecret))
+			} else {
+				e("abort", b.tp.AbortPoll(a.pollSecret, fmt.Sprintf("rejected by @%s", reply.name)))
 			}
+
+		case a := <-b.asks:
+			asks[a.slackTS] = a
 
 		case <-tick.C:
-			newAsks := []*chanAsk{}
-
-			thresh := time.Now().Add(-5 * time.Minute)
-
-			for _, ask := range asks {
-				if !ask.ts.Before(thresh) {
-					newAsks = append(newAsks, ask)
+			maps.DeleteFunc(asks, func(_ string, a *ask) bool {
+				if a.ts.After(time.Now().Add(-2 * time.Minute)) {
+					return false
 				}
-			}
 
-			asks = newAsks
+				e("abort", b.tp.AbortPoll(a.pollSecret, "timeout"))
+
+				return true
+			})
 		}
 	}
 }
 
-func (b *Bot) PostAttenuate(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-attenuate")
-
-	var buf strings.Builder
-	if _, err := io.Copy(&buf, io.LimitReader(r.Body, 10000)); e500(w, "read", err) {
-		return
-	}
-
-	permTok, dissToks, err := flyio.ParsePermissionAndDischargeTokens(buf.String())
-	if e500(w, "parse", err) {
-		return
-	}
-
-	// discourage sending of entire token...
-	if len(dissToks) != 0 {
-		http.Error(w, "only send permission token!", http.StatusBadRequest)
-		return
-	}
-
-	perm, err := macaroon.Decode(permTok)
-	if e500(w, "decode", err) {
-		return
-	}
-
-	if err := perm.Add3P(b.macaroonSecret, MacaroonLocation); e500(w, "attenuate", err) {
-		return
-	}
-
-	permStr, err := perm.String()
-	if e500(w, "encode", err) {
-		return
-	}
-
-	if _, err := w.Write([]byte(permStr)); e("write", err) {
-		return
-	}
-}
-
-func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
+func (b *bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-event")
 
 	body, err := io.ReadAll(r.Body)
@@ -173,7 +117,7 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sv, err := slack.NewSecretsVerifier(r.Header, b.signingSecret)
+	sv, err := slack.NewSecretsVerifier(r.Header, b.config.SlackSigningSecret)
 	if e500(w, "verify", err) {
 		return
 	}
@@ -193,26 +137,26 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if evt.Type == slackevents.URLVerification {
-		var r *slackevents.ChallengeResponse
-		err := json.Unmarshal([]byte(body), &r)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text")
-		w.Write([]byte(r.Challenge))
-	}
-
 	slog.Info("event rx", "event", evt)
 
-	if evt.Type == slackevents.CallbackEvent {
-		innerEvent := evt.InnerEvent
-		switch ev := innerEvent.Data.(type) {
+	switch evt.Type {
+	case slackevents.URLVerification:
+		var r slackevents.ChallengeResponse
+
+		if err := json.Unmarshal([]byte(body), &r); e500(w, "unmarshal", err) {
+			return
+		}
+
+		w.Header().Set("Content-Type", "text")
+		w.Write([]byte(r.Challenge))
+
+	case slackevents.CallbackEvent:
+		switch ev := evt.InnerEvent.Data.(type) {
 		case *slackevents.AppMentionEvent:
-			ch, ts, err := b.api.PostMessage(ev.Channel, slack.MsgOptionText("Yes, hello.", false))
+			ch, ts, err := b.api.PostMessageContext(r.Context(), ev.Channel, slack.MsgOptionText("Yes, hello.", false))
 			if err != nil {
 				e("post", err)
+				return
 			}
 
 			slog.Info("posted", "ch", ch, "ts", ts)
@@ -220,17 +164,17 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 		case *slackevents.ReactionAddedEvent:
 			switch reaction, _, _ := strings.Cut(ev.Reaction, "::"); reaction {
 			case "+1", "celeryman", "celebrate", "yes":
-				b.reacts <- chanReply{
+				b.replies <- &reply{
 					name:    ev.User,
 					answer:  true,
-					slackts: ev.Item.Timestamp,
+					slackTS: ev.Item.Timestamp,
 				}
 
 			default:
-				b.reacts <- chanReply{
+				b.replies <- &reply{
 					name:    ev.User,
 					answer:  false,
-					slackts: ev.Item.Timestamp,
+					slackTS: ev.Item.Timestamp,
 				}
 			}
 
@@ -239,100 +183,26 @@ func (b *Bot) PostEvent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type TicketRequest struct {
-	Name   string `json:"name"`
-	Ticket []byte `json:"ticket"`
-}
-
-type TicketReply struct {
-	Respondant string `json:"respondant"`
-	Discharge  []byte `json:"discharge"`
-	Approved   bool   `json:"approved"`
-}
-
-func (b *Bot) PostTicket(w http.ResponseWriter, r *http.Request) {
-	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "post-ticket")
-
-	tr := TicketRequest{}
-
-	err := json.NewDecoder(r.Body).Decode(&tr)
-	if e500(w, "decode ticket json", err) {
-		return
-	}
-
-	cavs, dm, err := macaroon.DischargeTicket(b.macaroonSecret, MacaroonLocation, tr.Ticket)
-	if e500(w, "decode ticket", err) {
-		return
-	}
-	if len(cavs) != 0 {
-		http.Error(w, "unsupported caveats in 3p caveat", http.StatusBadRequest)
-		return
-	}
-
-	discharge, err := dm.Encode()
-	if e500(w, "encode discharge", err) {
-		return
-	}
-
-	_, ts, err := b.api.PostMessage(TestChannel,
-		slack.MsgOptionText(fmt.Sprintf(":interrobang: @%s would like to deploy. :+1: or :-1:?", tr.Name), false))
-	if err != nil {
-		e("post", err)
-	}
-
-	ask := chanAsk{
-		slackts: ts,
-		name:    tr.Name,
-		reply:   make(chan chanReply),
-	}
-
-	b.asks <- ask
-
-	defer func() {
-		ask.kill = true
-		b.asks <- ask
-	}()
-
-	select {
-	case reply := <-ask.reply:
-		u, err := b.api.GetUserInfo(reply.name)
-		if err == nil {
-			reply.name = u.Name
-		}
-
-		trep := &TicketReply{
-			Respondant: reply.name,
-			Approved:   reply.answer,
-		}
-
-		if reply.answer {
-			trep.Discharge = discharge
-		}
-
-		json.NewEncoder(w).Encode(trep)
-
-	case <-r.Context().Done():
-		fmt.Fprintf(w, "timed out without response")
-		w.WriteHeader(http.StatusInternalServerError)
-	}
-}
-
-func (b *Bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
+func (b *bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
 	slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "discharge-init")
 
 	switch cavs, err := tp.CaveatsFromRequest(r); {
 	case err != nil:
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		e("caveats from request", err)
+		b.tp.RespondError(w, r, http.StatusBadRequest, err.Error())
 		return
 	case len(cavs) != 0:
-		http.Error(w, "unsupported caveats in 3p caveat", http.StatusBadRequest)
+		e("caveats in request", err)
+		b.tp.RespondError(w, r, http.StatusBadRequest, "unsupported caveats in 3p caveat")
 		return
 	}
 
-	_, ts, err := b.api.PostMessage(TestChannel,
-		slack.MsgOptionText(":interrobang: attempting to deploy. :+1: or :-1:?", false))
+	_, ts, err := b.api.PostMessage(b.config.SlackChannel,
+		slack.MsgOptionText(":interrobang: login attempt. :+1: or :-1:?", false))
 	if err != nil {
 		e("post", err)
+		b.tp.RespondError(w, r, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	pollSecret := b.tp.RespondPoll(w, r)
@@ -340,68 +210,96 @@ func (b *Bot) HandleDischargeInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b.asks <- chanAsk{
-		slackts:    ts,
+	b.asks <- &ask{
+		slackTS:    ts,
 		pollSecret: pollSecret,
+		ts:         time.Now(),
 	}
 }
 
 func main() {
-	s64 := os.Getenv("MACAROON_SECRET")
-	if s64 == "" {
-		slog.Error("no MACAROON_SECRET")
+	c, err := loadConfig()
+	if e("load config", err) {
 		return
 	}
 
-	secret, err := base64.StdEncoding.DecodeString(s64)
-	if e("decode MACAROON_SECRET", err) {
-		return
+	b := newBot(c)
+
+	go b.waitLoop()
+
+	e("serve", http.ListenAndServe(":3000", b))
+}
+
+type config struct {
+	MacaroonLocation   string `yaml:"macaroon_location"`
+	MacaroonSecret     string `yaml:"macaroon_secret"`
+	SlackChannel       string `yaml:"slack_channel"`
+	SlackSigningSecret string `yaml:"slack_signing_secret"`
+	SlackBotToken      string `yaml:"slack_bot_token"`
+}
+
+const configPath = "cookiebot.yml"
+
+func loadConfig() (*config, error) {
+	y, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(secret) != 32 {
-		slog.Error("MACAROON_SECRET should be 32 bytes")
-		return
+	ys := os.ExpandEnv(string(y))
+
+	var c config
+	if err := yaml.Unmarshal([]byte(ys), &c); err != nil {
+		return nil, err
 	}
 
-	store, err := tp.NewMemoryStore(nil, 1000)
-	if e("create memory store", err) {
-		return
+	if err := c.validate(); err != nil {
+		return nil, err
 	}
 
-	b := &Bot{
-		macaroonSecret: secret,
-		signingSecret:  os.Getenv("SLACK_SIGNING_SECRET"),
-		api:            slack.New(os.Getenv("SLACK_BOT_TOKEN")),
-		asks:           make(chan chanAsk),
-		reacts:         make(chan chanReply),
-		tp: &tp.TP{
-			Location: MacaroonLocation,
-			Key:      secret,
-			Store:    store,
-			Log:      logrus.StandardLogger(),
-		},
+	return &c, nil
+}
+
+func (c *config) validate() error {
+	switch {
+	case c.MacaroonLocation == "":
+		return errors.New("config is missing MacaroonLocation")
+	case c.MacaroonSecret == "":
+		return errors.New("config is missing MacaroonSecret")
+	case c.SlackChannel == "":
+		return errors.New("config is missing SlackChannel")
+	case c.SlackSigningSecret == "":
+		return errors.New("config is missing SlackSigningSecret")
+	case c.SlackBotToken == "":
+		return errors.New("config is missing SlackBotToken")
 	}
 
-	http.HandleFunc("/attenuate", b.PostAttenuate)
-	http.HandleFunc("/events-endpoint", b.PostEvent)
-	http.HandleFunc("/ticket", b.PostTicket)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("incoming", "remote", r.RemoteAddr, "method", r.Method, "uri", r.URL, "handler", "404")
-		w.WriteHeader(http.StatusNotFound)
-	})
+	if s, _ := base64.StdEncoding.DecodeString(c.MacaroonSecret); len(s) != 32 {
+		return errors.New("invalid MacaroonSecret")
+	}
 
-	http.Handle(LocationPath+tp.InitPath, b.tp.InitRequestMiddleware(
-		http.HandlerFunc(b.HandleDischargeInit),
-	))
+	return nil
+}
 
-	http.HandleFunc(LocationPath+tp.PollPathPrefix, b.tp.HandlePollRequest)
+func (c *config) getMacaroonSecret() []byte {
+	s, _ := base64.StdEncoding.DecodeString(c.MacaroonSecret)
+	return s
+}
 
-	slog.Info("server listening", "port", ":3000")
+func e(desc string, err error) bool {
+	if err == nil {
+		return false
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	slog.Error(desc, "error", err)
+	return true
+}
 
-	go b.WaitLoop(ctx)
+func e500(w http.ResponseWriter, desc string, err error) bool {
+	if e(desc, err) {
+		w.WriteHeader(http.StatusInternalServerError)
+		return true
+	}
 
-	http.ListenAndServe(":3000", nil)
+	return false
 }
